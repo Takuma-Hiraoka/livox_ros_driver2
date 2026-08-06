@@ -31,6 +31,42 @@
 
 namespace livox_ros {
 
+namespace {
+
+ExtParameterDetailed MakeExtrinsic(const LidarExtParameter& lidar_param) {
+  ExtParameterDetailed extrinsic = {
+    {0, 0, 0},
+    {
+      {1, 0, 0},
+      {0, 1, 0},
+      {0, 0, 1}
+    }
+  };
+
+  const double roll = static_cast<double>(lidar_param.param.roll * PI / 180.0);
+  const double pitch = static_cast<double>(lidar_param.param.pitch * PI / 180.0);
+  const double yaw = static_cast<double>(lidar_param.param.yaw * PI / 180.0);
+  const double cos_roll = cos(roll);
+  const double cos_pitch = cos(pitch);
+  const double cos_yaw = cos(yaw);
+  const double sin_roll = sin(roll);
+  const double sin_pitch = sin(pitch);
+  const double sin_yaw = sin(yaw);
+
+  extrinsic.rotation[0][0] = cos_pitch * cos_yaw;
+  extrinsic.rotation[0][1] = sin_roll * sin_pitch * cos_yaw - cos_roll * sin_yaw;
+  extrinsic.rotation[0][2] = cos_roll * sin_pitch * cos_yaw + sin_roll * sin_yaw;
+  extrinsic.rotation[1][0] = cos_pitch * sin_yaw;
+  extrinsic.rotation[1][1] = sin_roll * sin_pitch * sin_yaw + cos_roll * cos_yaw;
+  extrinsic.rotation[1][2] = cos_roll * sin_pitch * sin_yaw - sin_roll * cos_yaw;
+  extrinsic.rotation[2][0] = -sin_pitch;
+  extrinsic.rotation[2][1] = sin_roll * cos_pitch;
+  extrinsic.rotation[2][2] = cos_roll * cos_pitch;
+  return extrinsic;
+}
+
+}  // namespace
+
 std::atomic<bool> PubHandler::is_timestamp_sync_;
 
 PubHandler &pub_handler() {
@@ -82,11 +118,13 @@ void PubHandler::AddLidarsExtParam(LidarExtParameter& lidar_param) {
   uint32_t id = 0;
   GetLidarId(lidar_param.lidar_type, lidar_param.handle, id);
   lidar_extrinsics_[id] = lidar_param;
+  imu_extrinsics_[id] = MakeExtrinsic(lidar_param);
 }
 
 void PubHandler::ClearAllLidarsExtrinsicParams() {
   std::unique_lock<std::mutex> lock(packet_mutex_);
   lidar_extrinsics_.clear();
+  imu_extrinsics_.clear();
 }
 
 void PubHandler::SetPointCloudsCallback(PointCloudsCallback cb, void* client_data) {
@@ -116,12 +154,32 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
       imu_data.handle = handle;
       imu_data.time_stamp = GetEthPacketTimestamp(data->time_type,
                                                   data->timestamp, sizeof(data->timestamp));
-      imu_data.gyro_x = imu->gyro_x;
-      imu_data.gyro_y = imu->gyro_y;
-      imu_data.gyro_z = imu->gyro_z;
-      imu_data.acc_x = imu->acc_x;
-      imu_data.acc_y = imu->acc_y;
-      imu_data.acc_z = imu->acc_z;
+      ExtParameterDetailed extrinsic = MakeExtrinsic(LidarExtParameter{});
+      {
+        std::unique_lock<std::mutex> lock(self->packet_mutex_);
+        auto it = self->imu_extrinsics_.find(handle);
+        if (it != self->imu_extrinsics_.end()) {
+          extrinsic = it->second;
+        }
+      }
+      imu_data.gyro_x = imu->gyro_x * extrinsic.rotation[0][0] +
+                        imu->gyro_y * extrinsic.rotation[0][1] +
+                        imu->gyro_z * extrinsic.rotation[0][2];
+      imu_data.gyro_y = imu->gyro_x * extrinsic.rotation[1][0] +
+                        imu->gyro_y * extrinsic.rotation[1][1] +
+                        imu->gyro_z * extrinsic.rotation[1][2];
+      imu_data.gyro_z = imu->gyro_x * extrinsic.rotation[2][0] +
+                        imu->gyro_y * extrinsic.rotation[2][1] +
+                        imu->gyro_z * extrinsic.rotation[2][2];
+      imu_data.acc_x = imu->acc_x * extrinsic.rotation[0][0] +
+                       imu->acc_y * extrinsic.rotation[0][1] +
+                       imu->acc_z * extrinsic.rotation[0][2];
+      imu_data.acc_y = imu->acc_x * extrinsic.rotation[1][0] +
+                       imu->acc_y * extrinsic.rotation[1][1] +
+                       imu->acc_z * extrinsic.rotation[1][2];
+      imu_data.acc_z = imu->acc_x * extrinsic.rotation[2][0] +
+                       imu->acc_y * extrinsic.rotation[2][1] +
+                       imu->acc_z * extrinsic.rotation[2][2];
       self->imu_callback_(&imu_data, self->imu_client_data_);
     }
     return;
